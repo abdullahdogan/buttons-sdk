@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: buttons
+Description: Simple GPIO Button SDK for Raspberry Pi / Linux (gpiod/pigpio)
+Version: @BUTTONS_VERSION@
+Libs: -L${libdir} -lbuttons
+Cflags: -I${includedir}
