@@ -28,6 +28,12 @@ cmake --build "$BUILD_DIR/build" -j"$(nproc || echo 2)"
 
 echo "[*] Kurulum..."
 sudo cmake --install "$BUILD_DIR/build"
+
+sudo install -d /var/lib/keypad-hid
+sudo cp "$BUILD_DIR/build/install_manifest.txt" /var/lib/keypad-hid/install_manifest.txt
+# Linker cache tazele
+echo "/usr/local/lib" | sudo tee /etc/ld.so.conf.d/usrlocal.conf >/dev/null || true
+sudo ldconfig
 #dinamik linker
 sudo ldconfig
 #dinamik linker kontrol
