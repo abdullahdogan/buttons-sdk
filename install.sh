@@ -28,7 +28,11 @@ cmake --build "$BUILD_DIR/build" -j"$(nproc || echo 2)"
 
 echo "[*] Kurulum..."
 sudo cmake --install "$BUILD_DIR/build"
-
+#dinamik linker
+sudo ldconfig
+#dinamik linker kontrol
+echo "/usr/local/lib" | sudo tee /etc/ld.so.conf.d/usrlocal.conf >/dev/null || true
+sudo ldconfig
 # systemd servis dosyası (yoksa oluştur)
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 if [ ! -f "$SERVICE_PATH" ]; then
