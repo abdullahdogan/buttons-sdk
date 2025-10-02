@@ -3,6 +3,10 @@ project(buttons_sdk C)
 
 set(CMAKE_C_STANDARD 11)
 set(BUTTONS_VERSION 0.1.0)
+set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+set(CMAKE_BUILD_WITH_INSTALL_RPATH OFF)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
+
 option(BUILD_SHARED_LIBS "Build shared library" ON)
 
 # --- KÜTÜPHANE (yalnızca gpiod backend) ---
