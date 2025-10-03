@@ -39,3 +39,5 @@ configure_file(${CMAKE_SOURCE_DIR}/pkgconfig/buttons.pc.in
                ${CMAKE_BINARY_DIR}/buttons.pc @ONLY)
 install(FILES ${CMAKE_BINARY_DIR}/buttons.pc
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+install(PROGRAMS scripts/keypadctl DESTINATION ${CMAKE_INSTALL_BINDIR})

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SERVICE="${SERVICE_NAME:-keypad-hid}"
+
+usage() {
+  echo "Usage: keypadctl {start|stop|restart|status|enable|disable|logs [-f]|reload}"
+  exit 1
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  start)   exec sudo systemctl start "$SERVICE" ;;
+  stop)    exec sudo systemctl stop "$SERVICE" ;;
+  restart) exec sudo systemctl restart "$SERVICE" ;;
+  status)  exec systemctl status "$SERVICE" --no-pager ;;
+  enable)  exec sudo systemctl enable --now "$SERVICE" ;;
+  disable) exec sudo systemctl disable --now "$SERVICE" ;;
+  reload)  exec sudo systemctl daemon-reload ;;
+  logs)    exec journalctl -u "$SERVICE" "${1:-}" ;;
+  tail)    exec journalctl -u "$SERVICE" -f ;;
+  *)       usage ;;
+esac
