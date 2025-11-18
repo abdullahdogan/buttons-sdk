@@ -1,162 +1,263 @@
-#include "gpio_backend.h"
-#include <gpiod.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
 #include <pthread.h>
 #include <poll.h>
-#include <string.h>
+#include <errno.h>
 #include <unistd.h>
-#include <time.h>
-#include <stdio.h>
+#include <gpiod.h>
 
-#define MAX_GPIO 64
+#include "buttons.h"
 
-typedef struct {
-    int in_use;
-    unsigned gpio;
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
+#endif
+
+/* libgpiod v1/v2 otomatik algılama */
+#if defined(GPIOD_VERSION_MAJOR) && (GPIOD_VERSION_MAJOR >= 2)
+#define USE_GPIOD_V2 1
+#else
+#define USE_GPIOD_V1 1
+#endif
+
+typedef void (*btn_level_cb)(unsigned gpio, int level, void *user);
+
+struct reg_item {
+    unsigned        gpio;
+    bool            active_low;
+    bool            enable_pull;
+    btn_level_cb    cb;
+    void           *user;
+#ifdef USE_GPIOD_V1
     struct gpiod_line *line;
-    gpio_alert_cb cb;
-    void *userdata;
-} reg_t;
+#elif defined(USE_GPIOD_V2)
+    struct gpiod_line_request *req;
+#endif
+};
 
-static struct gpiod_chip *chip = NULL;
-static reg_t regs[MAX_GPIO];
-static pthread_t th;
-static volatile int running = 0;
+static pthread_t          g_thr;
+static volatile int       g_run = 0;
+static struct gpiod_chip *g_chip = NULL;
 
-// pull bias'ı hatırlayalım: 0 off, 1 up, 2 down
-static int bias_pref[MAX_GPIO];
+#define MAX_REGS 64
+static struct reg_item g_regs[MAX_REGS];
+static unsigned        g_reg_count = 0;
 
-static int gpio_to_offset(unsigned gpio){ return (int)gpio; }
+static int effective_level(int rising_edge, bool active_low)
+{
+    int level = rising_edge ? 1 : 0;
+    if (active_low) level = !level;
+    return level;
+}
 
-static void* monitor_thread(void *arg){
+#ifdef USE_GPIOD_V2
+static struct gpiod_line_request* v2_request_one(struct gpiod_chip *chip,
+                                                  unsigned offset,
+                                                  bool enable_pull,
+                                                  bool active_low)
+{
+    struct gpiod_line_settings *ls = gpiod_line_settings_new();
+    if (!ls) return NULL;
+
+    gpiod_line_settings_set_direction(ls, GPIOD_LINE_DIRECTION_INPUT);
+    gpiod_line_settings_set_edge_detection(ls, GPIOD_LINE_EDGE_BOTH);
+
+    if (enable_pull) {
+        gpiod_line_settings_set_bias(ls,
+            active_low ? GPIOD_LINE_BIAS_PULL_UP : GPIOD_LINE_BIAS_PULL_DOWN);
+    } else {
+        gpiod_line_settings_set_bias(ls, GPIOD_LINE_BIAS_AS_IS);
+    }
+
+    struct gpiod_line_config *lc = gpiod_line_config_new();
+    if (!lc) { gpiod_line_settings_free(ls); return NULL; }
+    if (gpiod_line_config_add_line_settings(lc, &offset, 1, ls)) {
+        gpiod_line_settings_free(ls);
+        gpiod_line_config_free(lc);
+        return NULL;
+    }
+    gpiod_line_settings_free(ls);
+
+    struct gpiod_request_config *rc = gpiod_request_config_new();
+    if (!rc) { gpiod_line_config_free(lc); return NULL; }
+    gpiod_request_config_set_consumer(rc, "buttons-sdk");
+    gpiod_request_config_set_event_buffer_size(rc, 16);
+
+    struct gpiod_line_request *req = gpiod_chip_request_lines(chip, rc, lc);
+    gpiod_request_config_free(rc);
+    gpiod_line_config_free(lc);
+    return req;
+}
+#endif
+
+static void* monitor_thread(void *arg)
+{
     (void)arg;
-    while (running){
-        struct pollfd fds[MAX_GPIO];
-        int idxmap[MAX_GPIO];
-        int nfds = 0;
+    g_run = 1;
 
-        for (int i=0;i<MAX_GPIO;i++){
-            if (regs[i].in_use && regs[i].line){
-                int fd = gpiod_line_event_get_fd(regs[i].line);
-                if (fd >= 0){
-                    fds[nfds].fd = fd;
-                    fds[nfds].events = POLLIN;
-                    idxmap[nfds] = i;
-                    nfds++;
-                }
-            }
+#ifdef USE_GPIOD_V2
+    struct pollfd pfds[MAX_REGS];
+    memset(pfds, 0, sizeof(pfds));
+
+    for (;;) {
+        if (!g_run) break;
+
+        unsigned n = 0;
+        for (unsigned i = 0; i < g_reg_count; i++) {
+            if (!g_regs[i].req) continue;
+            pfds[n].fd = gpiod_line_request_get_fd(g_regs[i].req);
+            pfds[n].events = POLLIN;
+            pfds[n].revents = 0;
+            n++;
         }
+        if (n == 0) { usleep(1000*100); continue; }
 
-        int to_ms = 100; // 100ms
-        int rc = poll(fds, nfds, to_ms);
+        int rc = poll(pfds, n, 1000);
         if (rc <= 0) continue;
 
-        for (int k=0;k<nfds;k++){
-            if (fds[k].revents & POLLIN){
-                struct gpiod_line_event ev;
-                int i = idxmap[k];
-                if (gpiod_line_event_read(regs[i].line, &ev) == 0){
-                    int level = (ev.event_type == GPIOD_LINE_EVENT_RISING_EDGE) ? 1 : 0;
-                    gpio_alert_cb cb = regs[i].cb;
-                    if (cb) cb(regs[i].gpio, level, 0, regs[i].userdata);
-                }
+        unsigned idx = 0;
+        for (unsigned i = 0; i < g_reg_count; i++) {
+            if (!g_regs[i].req) { idx++; continue; }
+            if (!(pfds[idx].revents & POLLIN)) { idx++; continue; }
+
+            struct gpiod_edge_event_buffer *buf = gpiod_edge_event_buffer_new(16);
+            if (!buf) { idx++; continue; }
+
+            int nread = gpiod_line_request_read_edge_events(g_regs[i].req, buf, 16);
+            for (int k = 0; k < nread; k++) {
+                const struct gpiod_edge_event *ev = gpiod_edge_event_buffer_get_event(buf, k);
+                if (!ev) continue;
+                int rising = (gpiod_edge_event_get_event_type(ev) == GPIOD_EDGE_EVENT_RISING_EDGE);
+                int level  = effective_level(rising, g_regs[i].active_low);
+                if (g_regs[i].cb) g_regs[i].cb(g_regs[i].gpio, level, g_regs[i].user);
             }
+            gpiod_edge_event_buffer_free(buf);
+            idx++;
         }
     }
+#elif defined(USE_GPIOD_V1)
+    struct pollfd pfds[MAX_REGS];
+    memset(pfds, 0, sizeof(pfds));
+
+    for (;;) {
+        if (!g_run) break;
+
+        unsigned n = 0;
+        for (unsigned i = 0; i < g_reg_count; i++) {
+            if (!g_regs[i].line) continue;
+            pfds[n].fd = gpiod_line_event_get_fd(g_regs[i].line);
+            pfds[n].events = POLLIN;
+            pfds[n].revents = 0;
+            n++;
+        }
+        if (n == 0) { usleep(1000*100); continue; }
+
+        int rc = poll(pfds, n, 1000);
+        if (rc <= 0) continue;
+
+        unsigned idx = 0;
+        for (unsigned i = 0; i < g_reg_count; i++) {
+            if (!g_regs[i].line) { idx++; continue; }
+            if (!(pfds[idx].revents & POLLIN)) { idx++; continue; }
+
+            struct gpiod_line_event ev;
+            while (gpiod_line_event_read(g_regs[i].line, &ev) == 0) {
+                int rising = (ev.event_type == GPIOD_LINE_EVENT_RISING_EDGE);
+                int level  = effective_level(rising, g_regs[i].active_low);
+                if (g_regs[i].cb) g_regs[i].cb(g_regs[i].gpio, level, g_regs[i].user);
+            }
+            idx++;
+        }
+    }
+#endif
     return NULL;
 }
 
-int gpio_backend_init(void){
-    memset(regs, 0, sizeof(regs));
-    memset(bias_pref, 0, sizeof(bias_pref));
-    chip = gpiod_chip_open("/dev/gpiochip0");
-    if (!chip) return -1;
-    running = 1;
-    if (pthread_create(&th, NULL, monitor_thread, NULL) != 0){
-        gpiod_chip_close(chip);
-        chip = NULL;
-        running = 0;
+/* buttons.c tarafından çağrılan backend arayüzü */
+int gpio_backend_init(void)
+{
+    if (g_chip) return 0;
+    g_chip = gpiod_chip_open("/dev/gpiochip0");
+    if (!g_chip) return -1;
+
+    g_reg_count = 0;
+    g_run = 1;
+    if (pthread_create(&g_thr, NULL, monitor_thread, NULL) != 0) {
+        gpiod_chip_close(g_chip); g_chip = NULL;
+        g_run = 0;
         return -1;
     }
     return 0;
 }
 
-void gpio_backend_term(void){
-    if (!chip) return;
-    running = 0;
-    pthread_join(th, NULL);
+void gpio_backend_term(void)
+{
+    g_run = 0;
+    if (g_thr) { pthread_join(g_thr, NULL); }
 
-    for (int i=0;i<MAX_GPIO;i++){
-        if (regs[i].in_use && regs[i].line){
-            gpiod_line_release(regs[i].line);
-            regs[i].line = NULL;
-            regs[i].in_use = 0;
+#ifdef USE_GPIOD_V1
+    for (unsigned i = 0; i < g_reg_count; i++) {
+        if (g_regs[i].line) {
+            gpiod_line_release(g_regs[i].line);
+            g_regs[i].line = NULL;
         }
     }
-    gpiod_chip_close(chip);
-    chip = NULL;
-}
-
-void gpio_set_mode_input(unsigned gpio){
-    (void)gpio; // libgpiod'de event request sırasında zaten input olarak alınır
-}
-
-void gpio_set_pull(unsigned gpio, int pull){
-    if (gpio < MAX_GPIO) bias_pref[gpio] = pull;
-}
-
-void gpio_set_glitch_filter(unsigned gpio, unsigned us){
-    (void)gpio; (void)us; // donanımsal filtre yok; yazılımsal debounce üst katmanda var
-}
-
-void gpio_set_alert(unsigned gpio, gpio_alert_cb cb, void *userdata){
-    if (gpio >= MAX_GPIO || !chip) return;
-
-    // varsa eski istek bırak
-    if (regs[gpio].in_use && regs[gpio].line){
-        gpiod_line_release(regs[gpio].line);
-        regs[gpio].line = NULL;
-        regs[gpio].in_use = 0;
+#elif defined(USE_GPIOD_V2)
+    for (unsigned i = 0; i < g_reg_count; i++) {
+        if (g_regs[i].req) {
+            gpiod_line_request_release(g_regs[i].req);
+            g_regs[i].req = NULL;
+        }
     }
+#endif
+    g_reg_count = 0;
 
-    if (!cb){
-        return; // sadece kaldırdık
-    }
+    if (g_chip) { gpiod_chip_close(g_chip); g_chip = NULL; }
+}
 
-    int offset = gpio_to_offset(gpio);
-    struct gpiod_line *line = gpiod_chip_get_line(chip, offset);
-    if (!line) return;
+int gpio_set_alert(unsigned gpio, bool active_low, bool enable_pull,
+                   void (*cb)(unsigned gpio, int level, void *user), void *user)
+{
+    if (!g_chip) return -1;
+    if (g_reg_count >= MAX_REGS) return -1;
+
+    struct reg_item item;
+    memset(&item, 0, sizeof(item));
+    item.gpio        = gpio;
+    item.active_low  = active_low;
+    item.enable_pull = enable_pull;
+    item.cb          = (btn_level_cb)cb;
+    item.user        = user;
+
+#ifdef USE_GPIOD_V2
+    item.req = v2_request_one(g_chip, gpio, enable_pull, active_low);
+    if (!item.req) return -1;
+#elif defined(USE_GPIOD_V1)
+    struct gpiod_line *line = gpiod_chip_get_line(g_chip, gpio);
+    if (!line) return -1;
 
     struct gpiod_line_request_config cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.consumer = "buttons-sdk";
     cfg.request_type = GPIOD_LINE_REQUEST_EVENT_BOTH_EDGES;
-    cfg.flags = 0;
 
-    // bias uygun ise isteyelim (çekme direnci)
+    int flags = 0;
 #ifdef GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP
-    if (bias_pref[gpio] == 1) cfg.flags |= GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP;
+    if (enable_pull && active_low)  flags |= GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP;
 #endif
 #ifdef GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN
-    if (bias_pref[gpio] == 2) cfg.flags |= GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN;
+    if (enable_pull && !active_low) flags |= GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_DOWN;
+#endif
+    cfg.flags = flags;
+
+    if (gpiod_line_request(line, &cfg, 0) != 0) {
+        return -1;
+    }
+    item.line = line;
 #endif
 
-    if (gpiod_line_request(line, &cfg, 0) == 0){
-        regs[gpio].in_use = 1;
-        regs[gpio].gpio = gpio;
-        regs[gpio].line = line;
-        regs[gpio].cb = cb;
-        regs[gpio].userdata = userdata;
-    } else {
-        // request başarısızsa line'ı bırak
-        gpiod_line_release(line);
-    }
-}
-
-void gpio_delay_ms(unsigned ms){
-    usleep(ms*1000u);
-}
-
-uint32_t gpio_now_ms(void){
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)(ts.tv_sec*1000u + ts.tv_nsec/1000000u);
+    g_regs[g_reg_count++] = item;
+    return 0;
 }
