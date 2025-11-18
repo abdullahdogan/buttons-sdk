@@ -15,11 +15,16 @@
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
 #endif
 
-/* libgpiod v1/v2 otomatik algılama */
-#if defined(GPIOD_VERSION_MAJOR) && (GPIOD_VERSION_MAJOR >= 2)
-#define USE_GPIOD_V2 1
+/* ---- libgpiod v1/v2 algılama (sağlam) ----
+ * v2 header'larında GPIOD_EDGE_EVENT_* makroları var.
+ * v1 header'larında GPIOD_LINE_EVENT_* makroları var.
+ */
+#if defined(GPIOD_EDGE_EVENT_RISING_EDGE)
+  #define USE_GPIOD_V2 1
+#elif defined(GPIOD_LINE_EVENT_RISING_EDGE)
+  #define USE_GPIOD_V1 1
 #else
-#define USE_GPIOD_V1 1
+  #error "Unsupported libgpiod headers: cannot detect v1 or v2"
 #endif
 
 typedef void (*btn_level_cb)(unsigned gpio, int level, void *user);
@@ -30,7 +35,7 @@ struct reg_item {
     bool            enable_pull;
     btn_level_cb    cb;
     void           *user;
-#ifdef USE_GPIOD_V1
+#if defined(USE_GPIOD_V1)
     struct gpiod_line *line;
 #elif defined(USE_GPIOD_V2)
     struct gpiod_line_request *req;
@@ -48,11 +53,11 @@ static unsigned        g_reg_count = 0;
 static int effective_level(int rising_edge, bool active_low)
 {
     int level = rising_edge ? 1 : 0;
-    if (active_low) level = !level;
-    return level;
+    return active_low ? !level : level;
 }
 
-#ifdef USE_GPIOD_V2
+#if defined(USE_GPIOD_V2)
+/* ---- v2: tek pin için request oluştur ---- */
 static struct gpiod_line_request* v2_request_one(struct gpiod_chip *chip,
                                                   unsigned offset,
                                                   bool enable_pull,
@@ -60,7 +65,6 @@ static struct gpiod_line_request* v2_request_one(struct gpiod_chip *chip,
 {
     struct gpiod_line_settings *ls = gpiod_line_settings_new();
     if (!ls) return NULL;
-
     gpiod_line_settings_set_direction(ls, GPIOD_LINE_DIRECTION_INPUT);
     gpiod_line_settings_set_edge_detection(ls, GPIOD_LINE_EDGE_BOTH);
 
@@ -92,15 +96,14 @@ static struct gpiod_line_request* v2_request_one(struct gpiod_chip *chip,
 }
 #endif
 
+/* ---- İzleme thread'i ---- */
 static void* monitor_thread(void *arg)
 {
     (void)arg;
     g_run = 1;
 
-#ifdef USE_GPIOD_V2
-    struct pollfd pfds[MAX_REGS];
-    memset(pfds, 0, sizeof(pfds));
-
+#if defined(USE_GPIOD_V2)
+    struct pollfd pfds[MAX_REGS] = {0};
     for (;;) {
         if (!g_run) break;
 
@@ -138,9 +141,7 @@ static void* monitor_thread(void *arg)
         }
     }
 #elif defined(USE_GPIOD_V1)
-    struct pollfd pfds[MAX_REGS];
-    memset(pfds, 0, sizeof(pfds));
-
+    struct pollfd pfds[MAX_REGS] = {0};
     for (;;) {
         if (!g_run) break;
 
@@ -175,7 +176,7 @@ static void* monitor_thread(void *arg)
     return NULL;
 }
 
-/* buttons.c tarafından çağrılan backend arayüzü */
+/* ---- Backend API (buttons.c çağırır) ---- */
 int gpio_backend_init(void)
 {
     if (g_chip) return 0;
@@ -197,7 +198,7 @@ void gpio_backend_term(void)
     g_run = 0;
     if (g_thr) { pthread_join(g_thr, NULL); }
 
-#ifdef USE_GPIOD_V1
+#if defined(USE_GPIOD_V1)
     for (unsigned i = 0; i < g_reg_count; i++) {
         if (g_regs[i].line) {
             gpiod_line_release(g_regs[i].line);
@@ -223,15 +224,14 @@ int gpio_set_alert(unsigned gpio, bool active_low, bool enable_pull,
     if (!g_chip) return -1;
     if (g_reg_count >= MAX_REGS) return -1;
 
-    struct reg_item item;
-    memset(&item, 0, sizeof(item));
+    struct reg_item item = {0};
     item.gpio        = gpio;
     item.active_low  = active_low;
     item.enable_pull = enable_pull;
     item.cb          = (btn_level_cb)cb;
     item.user        = user;
 
-#ifdef USE_GPIOD_V2
+#if defined(USE_GPIOD_V2)
     item.req = v2_request_one(g_chip, gpio, enable_pull, active_low);
     if (!item.req) return -1;
 #elif defined(USE_GPIOD_V1)
@@ -252,9 +252,7 @@ int gpio_set_alert(unsigned gpio, bool active_low, bool enable_pull,
 #endif
     cfg.flags = flags;
 
-    if (gpiod_line_request(line, &cfg, 0) != 0) {
-        return -1;
-    }
+    if (gpiod_line_request(line, &cfg, 0) != 0) return -1;
     item.line = line;
 #endif
 
