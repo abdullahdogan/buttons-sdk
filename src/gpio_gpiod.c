@@ -15,16 +15,11 @@
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
 #endif
 
-/* ---- libgpiod v1/v2 algılama (sağlam) ----
- * v2 header'larında GPIOD_EDGE_EVENT_* makroları var.
- * v1 header'larında GPIOD_LINE_EVENT_* makroları var.
+/* CMake tarafı: USE_GPIOD_V2 veya USE_GPIOD_V1 tanımlar.
+ * Biri tanımlı değilse, derlemeyi durdur.
  */
-#if defined(GPIOD_EDGE_EVENT_RISING_EDGE)
-  #define USE_GPIOD_V2 1
-#elif defined(GPIOD_LINE_EVENT_RISING_EDGE)
-  #define USE_GPIOD_V1 1
-#else
-  #error "Unsupported libgpiod headers: cannot detect v1 or v2"
+#if !defined(USE_GPIOD_V2) && !defined(USE_GPIOD_V1)
+# error "Define USE_GPIOD_V2 or USE_GPIOD_V1 from build system."
 #endif
 
 typedef void (*btn_level_cb)(unsigned gpio, int level, void *user);
@@ -65,6 +60,7 @@ static struct gpiod_line_request* v2_request_one(struct gpiod_chip *chip,
 {
     struct gpiod_line_settings *ls = gpiod_line_settings_new();
     if (!ls) return NULL;
+
     gpiod_line_settings_set_direction(ls, GPIOD_LINE_DIRECTION_INPUT);
     gpiod_line_settings_set_edge_detection(ls, GPIOD_LINE_EDGE_BOTH);
 
@@ -176,7 +172,7 @@ static void* monitor_thread(void *arg)
     return NULL;
 }
 
-/* ---- Backend API (buttons.c çağırır) ---- */
+/* ---- Backend API ---- */
 int gpio_backend_init(void)
 {
     if (g_chip) return 0;
