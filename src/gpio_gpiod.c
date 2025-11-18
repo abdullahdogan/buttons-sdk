@@ -10,7 +10,7 @@
 #include <gpiod.h>
 
 #include "buttons.h"
-
+#include <time.h>
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
 #endif
@@ -253,5 +253,47 @@ int gpio_set_alert(unsigned gpio, bool active_low, bool enable_pull,
 #endif
 
     g_regs[g_reg_count++] = item;
+    return 0;
+}
+/* ==== Backend-agnostic yardımcılar (buttons.c'nin çağırdığı) ==== */
+
+
+/* Monotonic zaman (ms) */
+uint64_t gpio_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+/* ms gecikme */
+void gpio_delay_ms(unsigned ms)
+{
+    struct timespec ts;
+    ts.tv_sec  = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+
+/* Giriş moda alma — gpiod tarafında line request ile zaten INPUT istenir.
+ * Burada no-op yeterlidir. */
+int gpio_set_mode_input(unsigned gpio)
+{
+    (void)gpio;
+    return 0;
+}
+
+/* Pull-up/down ayarı — gpiod v2’de bias, request sırasında veriliyor.
+ * Burada no-op; gerçek bias gpio_set_alert() içinde uygulanıyor. */
+int gpio_set_pull(unsigned gpio, int pull /* 0:none, 1:down, 2:up (simgesel) */)
+{
+    (void)gpio; (void)pull;
+    return 0;
+}
+
+/* Glitch filter — yazılımsal debounce buttons.c içinde yapılıyor; no-op. */
+int gpio_set_glitch_filter(unsigned gpio, unsigned us)
+{
+    (void)gpio; (void)us;
     return 0;
 }
