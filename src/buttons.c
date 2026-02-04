@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-
+#include "version.h"
 typedef struct {
     unsigned gpio;
     int  pull;            // 0/1/2
@@ -140,4 +140,17 @@ void btns_destroy(btns_ctx_t *ctx){
 bool btns_is_pressed(btns_ctx_t *ctx, unsigned index){
     if (!ctx || index>=ctx->cfg.count) return false;
     return ctx->st[index].pressed;
+}
+const char *buttons_version(void) {
+    return BUTTONS_VERSION;
+}
+
+void buttons_log_buildinfo(FILE *out) {
+    if (!out) out = stderr;
+    fprintf(out,
+        "[buttons-sdk] version=%s hash=%s build=%s libgpiod=%s\n",
+        BUTTONS_VERSION, BUTTONS_GIT_HASH, BUTTONS_BUILD_TIME, BUTTONS_GPIOD_VER);
+    // Per-module identifiers (library files)
+    fprintf(out, "[buttons-sdk] file=buttons.c@%s\n", BUTTONS_VERSION);
+    fprintf(out, "[buttons-sdk] file=gpio_gpiod.c@%s\n", BUTTONS_VERSION);
 }
