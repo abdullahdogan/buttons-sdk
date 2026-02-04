@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Virtual keyboard daemon (GPIO -> uinput) with libgpiod v2 backend
+// GPIO -> uinput virtual keyboard (libgpiod v2 backend)
 // ASCII-only comments.
 
 #include <stdio.h>
@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -15,11 +16,33 @@
 #include <linux/uinput.h>
 #include <linux/input.h>
 
-#include "buttons.h"  // provides BUTTONS_MAX_LINES and gpio helpers
+#if __has_include("buttons.h")
+  #include "buttons.h"
+#elif __has_include("../src/buttons.h")
+  #include "../src/buttons.h"
+#else
+  // Fallback for build-only environment
+  #ifndef BUTTONS_MAX_LINES
+  #define BUTTONS_MAX_LINES 64
+  #endif
+  struct buttons_gpio_ctx;
+  int buttons_gpio_open(struct buttons_gpio_ctx **out, const char *chip_name,
+                        const unsigned *offsets, size_t n_offsets,
+                        bool active_low, unsigned debounce_ms,
+                        size_t queue_capacity);
+  int buttons_gpio_poll(struct buttons_gpio_ctx *ctx, int timeout_ms,
+                        int (*on_event)(unsigned offset, bool rising, uint64_t ts_ns, void *user),
+                        void *user);
+  void buttons_gpio_close(struct buttons_gpio_ctx *ctx);
+#endif
+
+#ifndef BUTTONS_MAX_LINES
+#define BUTTONS_MAX_LINES 64
+#endif
 
 struct key_map {
-    unsigned offset;   // GPIO line offset
-    int keycode;       // Linux input key code
+    unsigned offset;   // gpio line offset
+    int keycode;       // linux input key code
 };
 
 struct state_per_line {
@@ -36,14 +59,14 @@ struct app_ctx {
     struct state_per_line st[BUTTONS_MAX_LINES];
 };
 
-// --- time helpers ---
+// ---- time helpers ----
 
 static uint64_t tv_to_ns(const struct timeval *tv)
 {
     return (uint64_t)tv->tv_sec * 1000000000ull + (uint64_t)tv->tv_usec * 1000ull;
 }
 
-// --- uinput helpers ---
+// ---- uinput helpers ----
 
 static int uinput_open(void)
 {
@@ -56,8 +79,7 @@ static int uinput_setup_keyboard(int fd, const int *keycodes, size_t n)
 {
     if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0) return -errno;
     if (ioctl(fd, UI_SET_EVBIT, EV_SYN) < 0) return -errno;
-
-    // Do not enable EV_REP to avoid OS auto-repeat from this device.
+    // Do not enable EV_REP (no OS autorepeat from this device)
 
     for (size_t i = 0; i < n; i++) {
         if (keycodes[i] > 0)
@@ -81,7 +103,7 @@ static int uinput_emit(int fd, uint16_t type, uint16_t code, int32_t value)
 {
     struct input_event ev;
     memset(&ev, 0, sizeof(ev));
-    gettimeofday(&ev.time, NULL); // timeval expected by input_event
+    gettimeofday(&ev.time, NULL); // input_event expects timeval
     ev.type  = type;
     ev.code  = code;
     ev.value = value;
@@ -106,11 +128,10 @@ static int uinput_send_key(int fd, int keycode, int value01)
     return uinput_emit(fd, EV_KEY, (uint16_t)keycode, value01);
 }
 
-// --- key map parse ---
+// ---- key map parse ----
 
 static int keyname_to_code(const char *name)
 {
-    // Accept a small set; extend as needed.
     if (strcasecmp(name, "up")    == 0) return KEY_UP;
     if (strcasecmp(name, "down")  == 0) return KEY_DOWN;
     if (strcasecmp(name, "left")  == 0) return KEY_LEFT;
@@ -118,7 +139,6 @@ static int keyname_to_code(const char *name)
     if (strcasecmp(name, "enter") == 0) return KEY_ENTER;
     if (strcasecmp(name, "esc")   == 0 || strcasecmp(name, "escape") == 0) return KEY_ESC;
 
-    // Also allow numeric codes (e.g., 30=A).
     char *end = NULL;
     long v = strtol(name, &end, 0);
     if (end && *end == '\0' && v > 0 && v < 1024) return (int)v;
@@ -128,7 +148,6 @@ static int keyname_to_code(const char *name)
 
 static int parse_map(const char *spec, struct key_map *out, size_t *count_out)
 {
-    // Format: "17:up,22:down,23:left,24:right,25:enter,27:esc"
     if (!spec || !out || !count_out) return -EINVAL;
     char *tmp = strdup(spec);
     if (!tmp) return -ENOMEM;
@@ -168,62 +187,49 @@ static int build_offsets_array(const struct key_map *m, size_t n, unsigned *offs
     return 0;
 }
 
-static int find_keycode_by_offset(const struct app_ctx *app, unsigned offset)
-{
-    for (size_t i = 0; i < app->map_count; i++)
-        if (app->map[i].offset == offset) return app->map[i].keycode;
-    return -1;
-}
-
-// --- event callback ---
+// ---- gpio event callback ----
 
 static int on_gpio_event(unsigned offset, bool rising, uint64_t ts_ns, void *user)
 {
     struct app_ctx *app = (struct app_ctx *)user;
-
-    // Logical press on rising, release on falling (active-low handled in backend).
     int level = rising ? 1 : 0;
 
-    // Per-line state slot index lookup
     size_t idx = SIZE_MAX;
     for (size_t i = 0; i < app->map_count; i++)
         if (app->map[i].offset == offset) { idx = i; break; }
-    if (idx == SIZE_MAX) return 0; // unmapped, ignore
+    if (idx == SIZE_MAX) return 0;
 
     struct state_per_line *st = &app->st[idx];
-
-    // Gap filter: ignore if same-kind event within min_gap_ms
     uint64_t gap_ns = (uint64_t)app->min_gap_ms * 1000000ull;
+
     if (st->last_level == level) {
         if (st->last_ts_ns != 0 && ts_ns - st->last_ts_ns < gap_ns)
-            return 0;
+            return 0; // suppress same-kind spam within min-gap
     }
 
     int keycode = app->map[idx].keycode;
     if (keycode < 0) return 0;
 
-    // Avoid duplicate emits: only emit when level actually changes
     if (st->last_level != level) {
         int rc = uinput_send_key(app->ufd, keycode, level ? 1 : 0);
         if (rc) return rc;
         st->last_level = level;
         st->last_ts_ns = ts_ns;
     } else {
-        // Same level but passed gap; update timestamp only
         st->last_ts_ns = ts_ns;
     }
 
     return 0;
 }
 
-// --- args and main ---
+// ---- usage ----
 
 static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s [--chip <name_or_path>] [--active-low] [--debounce-ms N]\n"
         "          [--min-gap-ms N] --map \"off:key,...\"\n"
-        "Example: %s --chip gpiochip0 --active-low --debounce-ms 35 \\\n"
+        "Example: %s --chip gpiochip0 --active-low --debounce-ms 35 \n"
         "          --min-gap-ms 150 --map \"17:up,22:down,23:left,24:right,25:enter,27:esc\"\n",
         prog, prog);
 }
@@ -246,32 +252,25 @@ int main(int argc, char **argv)
         fprintf(stderr, "Unknown option: %s\n", argv[i]); usage(argv[0]); return 2;
     }
 
-    if (!map_spec) {
-        fprintf(stderr, "--map is required.\n"); usage(argv[0]); return 2;
-    }
+    if (!map_spec) { fprintf(stderr, "--map is required.\n"); usage(argv[0]); return 2; }
 
     struct key_map map[BUTTONS_MAX_LINES];
     size_t map_count = 0;
     if (parse_map(map_spec, map, &map_count) != 0) {
-        fprintf(stderr, "Invalid --map.\n");
-        return 2;
+        fprintf(stderr, "Invalid --map.\n"); return 2;
     }
 
     unsigned offsets[BUTTONS_MAX_LINES];
     build_offsets_array(map, map_count, offsets);
 
     int ufd = uinput_open();
-    if (ufd < 0) {
-        fprintf(stderr, "uinput open failed: %s\n", strerror(-ufd));
-        return 1;
-    }
+    if (ufd < 0) { fprintf(stderr, "uinput open failed: %s\n", strerror(-ufd)); return 1; }
 
     int keycodes[BUTTONS_MAX_LINES];
     for (size_t i = 0; i < map_count; i++) keycodes[i] = map[i].keycode;
     if (uinput_setup_keyboard(ufd, keycodes, map_count) != 0) {
         fprintf(stderr, "uinput setup failed.\n");
-        close(ufd);
-        return 1;
+        close(ufd); return 1;
     }
 
     struct app_ctx app;
@@ -288,17 +287,12 @@ int main(int argc, char **argv)
     if (buttons_gpio_open(&app.gpio, chip, offsets, map_count, active_low, debounce_ms, 64) != 0) {
         fprintf(stderr, "gpio open failed.\n");
         ioctl(ufd, UI_DEV_DESTROY);
-        close(ufd);
-        return 1;
+        close(ufd); return 1;
     }
 
     for (;;) {
         int r = buttons_gpio_poll(app.gpio, 1000, on_gpio_event, &app);
-        if (r < 0) {
-            // transient errors may occur; break on fatal
-            fprintf(stderr, "poll error: %d\n", r);
-            break;
-        }
+        if (r < 0) { fprintf(stderr, "poll error: %d\n", r); break; }
     }
 
     buttons_gpio_close(app.gpio);
