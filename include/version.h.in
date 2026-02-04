@@ -1,0 +1,6 @@
+#pragma once
+// Auto-generated at configure time.
+#define BUTTONS_VERSION      "@GIT_DESC@"
+#define BUTTONS_GIT_HASH     "@GIT_HASH@"
+#define BUTTONS_BUILD_TIME   "@BUILD_TIME@"
+#define BUTTONS_GPIOD_VER    "@GPIOD_VER@"
