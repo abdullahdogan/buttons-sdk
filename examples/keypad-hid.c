@@ -1,208 +1,239 @@
 // SPDX-License-Identifier: MIT
-// GPIO backend for libgpiod v2.x
-// Notes:
-// - Uses gpiod v2 API (gpiod_chip_open, *_debounce_period_us, edge event buffer)
-// - Never free single edge events (buffer owns them)
-// - Builds a single request for all input lines with both-edge detection
+// Keypad -> uinput virtual keyboard (libgpiod v2.x backend)
+// Software repeat filter: drops events if same key repeats within min_gap_ms.
+// All comments are ASCII only.
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-#include <errno.h>
 #include <time.h>
-#include <poll.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <linux/uinput.h>
+#include <errno.h>
 
-#include <gpiod.h>
-#include "buttons.h"    // keep existing public prototypes/types
+#include "buttons.h"
 
-#ifndef BUTTONS_MAX_LINES
-#define BUTTONS_MAX_LINES 32
-#endif
+#define ARRAYSZ(a) (sizeof(a)/sizeof(a[0]))
 
-struct buttons_gpio_ctx {
-    struct gpiod_chip            *chip;
-    struct gpiod_line_settings   *ls_in;
-    struct gpiod_line_config     *lc;
-    struct gpiod_request_config  *rc;
-    struct gpiod_line_request    *req;
-    struct gpiod_edge_event_buffer *evbuf;
-
-    unsigned offsets[BUTTONS_MAX_LINES];
-    size_t   count;
-    bool     active_low;
-    uint32_t debounce_ms;
+struct key_map {
+    unsigned offset;
+    int keycode;
 };
 
-static int make_devpath(const char *chip_name, char out[128])
+struct app {
+    struct buttons_gpio_ctx *gpio;
+    struct key_map *map;
+    size_t map_count;
+    int ufd;
+    unsigned min_gap_ms;
+
+    // last send timestamp per key (ns)
+    uint64_t last_sent_ns[256]; // simple small table for common keycodes
+};
+
+static int uinput_setup(void)
 {
-    if (!chip_name || !*chip_name)
-        return -EINVAL;
-    if (chip_name[0] == '/')
-        snprintf(out, 128, "%s", chip_name);
-    else
-        snprintf(out, 128, "/dev/%s", chip_name);
+    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (fd < 0) return -errno;
+
+    ioctl(fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(fd, UI_SET_EVBIT, EV_SYN);
+
+    // Allow common keys
+    ioctl(fd, UI_SET_KEYBIT, KEY_ESC);
+    ioctl(fd, UI_SET_KEYBIT, KEY_ENTER);
+    ioctl(fd, UI_SET_KEYBIT, KEY_UP);
+    ioctl(fd, UI_SET_KEYBIT, KEY_DOWN);
+    ioctl(fd, UI_SET_KEYBIT, KEY_LEFT);
+    ioctl(fd, UI_SET_KEYBIT, KEY_RIGHT);
+
+    struct uinput_user_dev uidev;
+    memset(&uidev, 0, sizeof(uidev));
+    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "Keypad HID (buttons-sdk)");
+    uidev.id.bustype = BUS_USB;
+    uidev.id.vendor  = 0x0001;
+    uidev.id.product = 0x0001;
+    uidev.id.version = 1;
+
+    if (write(fd, &uidev, sizeof(uidev)) < 0) {
+        int e = -errno;
+        close(fd);
+        return e;
+    }
+    if (ioctl(fd, UI_DEV_CREATE) < 0) {
+        int e = -errno;
+        close(fd);
+        return e;
+    }
+    // small settle
+    usleep(100 * 1000);
+    return fd;
+}
+
+static void uinput_send(int fd, int keycode, int value)
+{
+    struct input_event ev;
+    memset(&ev, 0, sizeof(ev));
+    clock_gettime(CLOCK_MONOTONIC, &ev.time);
+    ev.type = EV_KEY;
+    ev.code = keycode;
+    ev.value = value;
+    write(fd, &ev, sizeof(ev));
+
+    memset(&ev, 0, sizeof(ev));
+    clock_gettime(CLOCK_MONOTONIC, &ev.time);
+    ev.type = EV_SYN;
+    ev.code = SYN_REPORT;
+    ev.value = 0;
+    write(fd, &ev, sizeof(ev));
+}
+
+static int key_for_offset(struct app *app, unsigned off)
+{
+    for (size_t i = 0; i < app->map_count; i++)
+        if (app->map[i].offset == off)
+            return app->map[i].keycode;
+    return -1;
+}
+
+static inline uint64_t ns_to_ms(uint64_t ns) { return ns / 1000000ULL; }
+
+static int on_gpio_event(unsigned offset, bool rising, uint64_t ts_ns, void *user)
+{
+    struct app *app = (struct app *)user;
+    int key = key_for_offset(app, offset);
+    if (key < 0) return 0;
+
+    // Simple edge -> press/release policy:
+    // rising  => press(1)
+    // falling => release(0)
+    int value = rising ? 1 : 0;
+
+    // Software min-gap filter (applied only to press events)
+    if (value == 1) {
+        uint64_t last = app->last_sent_ns[(key < 0 || key > 255) ? 0 : key];
+        if (last) {
+            uint64_t delta_ms = ns_to_ms(ts_ns - last);
+            if (delta_ms < app->min_gap_ms)
+                return 0; // drop rapid repeat
+        }
+        app->last_sent_ns[(key < 0 || key > 255) ? 0 : key] = ts_ns;
+    }
+
+    uinput_send(app->ufd, key, value);
+
+    // Optional: generate short tap (press+release) for rising only
+    // If hardware does not provide falling edges reliably, enable this:
+    // if (rising) { usleep(5*1000); uinput_send(app->ufd, key, 0); }
+
     return 0;
 }
 
-int buttons_gpio_open(struct buttons_gpio_ctx **out,
-                      const char *chip_name,
-                      const unsigned *offsets,
-                      size_t count,
-                      bool active_low,
-                      unsigned debounce_ms,
-                      unsigned event_buf)
+static void usage(const char *prog)
 {
-    if (!out || !chip_name || !offsets || !count || count > BUTTONS_MAX_LINES)
-        return -EINVAL;
+    fprintf(stderr,
+        "Usage: %s --chip <gpiochipX or /dev/gpiochipX> [--active-low]\n"
+        "           [--debounce-ms N] [--min-gap-ms N]\n"
+        "           --map \"<off>:<name>,...\"\n"
+        "Names: up,down,left,right,enter,esc\n",
+        prog);
+}
 
-    *out = NULL;
+static int parse_map(const char *s, struct key_map *out, size_t *count)
+{
+    // Example: "17:up,22:down,23:left,24:right,25:enter,27:esc"
+    char *tmp = strdup(s ? s : "");
+    if (!tmp) return -ENOMEM;
+    size_t n = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(tmp, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        if (n >= BUTTONS_MAX_LINES) { free(tmp); return -EINVAL; }
+        unsigned off = 0;
+        char name[32] = {0};
+        if (sscanf(tok, "%u:%31s", &off, name) != 2) { free(tmp); return -EINVAL; }
+        int code = -1;
+        if      (!strcmp(name, "up"))    code = KEY_UP;
+        else if (!strcmp(name, "down"))  code = KEY_DOWN;
+        else if (!strcmp(name, "left"))  code = KEY_LEFT;
+        else if (!strcmp(name, "right")) code = KEY_RIGHT;
+        else if (!strcmp(name, "enter")) code = KEY_ENTER;
+        else if (!strcmp(name, "esc"))   code = KEY_ESC;
+        else { free(tmp); return -EINVAL; }
 
-    struct buttons_gpio_ctx *ctx = calloc(1, sizeof(*ctx));
-    if (!ctx) return -ENOMEM;
-
-    ctx->count      = count;
-    ctx->active_low = active_low;
-    ctx->debounce_ms = debounce_ms ? debounce_ms : 0;
-
-    for (size_t i = 0; i < count; i++)
-        ctx->offsets[i] = offsets[i];
-
-    char dev[128];
-    int rc = make_devpath(chip_name, dev);
-    if (rc) { free(ctx); return rc; }
-
-    ctx->chip = gpiod_chip_open(dev);
-    if (!ctx->chip) {
-        rc = -errno ? -errno : -ENODEV;
-        free(ctx);
-        return rc;
+        out[n].offset  = off;
+        out[n].keycode = code;
+        n++;
     }
-
-    // line settings: input, both edges, optional active-low and debounce
-    ctx->ls_in = gpiod_line_settings_new();
-    if (!ctx->ls_in) { rc = -ENOMEM; goto fail; }
-
-    gpiod_line_settings_set_direction(ctx->ls_in, GPIOD_LINE_DIRECTION_INPUT);
-    gpiod_line_settings_set_edge_detection(ctx->ls_in, GPIOD_LINE_EDGE_BOTH);
-
-    if (ctx->active_low)
-        gpiod_line_settings_set_active_low(ctx->ls_in, true);
-
-    // Bias is left as "as is" unless buttons.h exposes a policy; keep default.
-
-    if (ctx->debounce_ms > 0)
-        gpiod_line_settings_set_debounce_period_us(ctx->ls_in,
-                                                   (uint32_t)ctx->debounce_ms * 1000U);
-
-    ctx->lc = gpiod_line_config_new();
-    if (!ctx->lc) { rc = -ENOMEM; goto fail; }
-
-    if (gpiod_line_config_add_line_settings(ctx->lc, ctx->offsets, (unsigned)ctx->count, ctx->ls_in)) {
-        rc = -errno ? -errno : -EINVAL;
-        goto fail;
-    }
-
-    ctx->rc = gpiod_request_config_new();
-    if (!ctx->rc) { rc = -ENOMEM; goto fail; }
-
-    gpiod_request_config_set_consumer(ctx->rc, "buttons-sdk");
-    if (event_buf == 0) event_buf = 32;
-    gpiod_request_config_set_event_buffer_size(ctx->rc, event_buf);
-
-    ctx->req = gpiod_chip_request_lines(ctx->chip, ctx->rc, ctx->lc);
-    if (!ctx->req) {
-        rc = -errno ? -errno : -EIO;
-        goto fail;
-    }
-
-    ctx->evbuf = gpiod_edge_event_buffer_new(event_buf);
-    if (!ctx->evbuf) {
-        rc = -ENOMEM;
-        goto fail;
-    }
-
-    *out = ctx;
+    *count = n;
+    free(tmp);
     return 0;
-
-fail:
-    if (ctx->evbuf) gpiod_edge_event_buffer_free(ctx->evbuf);
-    if (ctx->req)   gpiod_line_request_release(ctx->req);
-    if (ctx->rc)    gpiod_request_config_free(ctx->rc);
-    if (ctx->lc)    gpiod_line_config_free(ctx->lc);
-    if (ctx->ls_in) gpiod_line_settings_free(ctx->ls_in);
-    if (ctx->chip)  gpiod_chip_close(ctx->chip);
-    free(ctx);
-    return rc;
 }
 
-void buttons_gpio_close(struct buttons_gpio_ctx *ctx)
+int main(int argc, char **argv)
 {
-    if (!ctx) return;
-    if (ctx->evbuf) gpiod_edge_event_buffer_free(ctx->evbuf);
-    if (ctx->req)   gpiod_line_request_release(ctx->req);
-    if (ctx->rc)    gpiod_request_config_free(ctx->rc);
-    if (ctx->lc)    gpiod_line_config_free(ctx->lc);
-    if (ctx->ls_in) gpiod_line_settings_free(ctx->ls_in);
-    if (ctx->chip)  gpiod_chip_close(ctx->chip);
-    free(ctx);
-}
+    const char *chip = "gpiochip0";
+    bool active_low = false;
+    unsigned debounce_ms = 35;
+    unsigned min_gap_ms = 150;
+    const char *map_str = NULL;
 
-// Helper: poll request FD
-static int wait_fd(struct buttons_gpio_ctx *ctx, int timeout_ms)
-{
-    int fd = gpiod_line_request_get_poll_fd(ctx->req);
-    if (fd < 0) return -EIO;
-
-    struct pollfd p = { .fd = fd, .events = POLLIN };
-    int pr = poll(&p, 1, timeout_ms);
-    if (pr < 0) return -errno;
-    if (pr == 0) return 0; // timeout
-    if (p.revents & POLLIN) return 1;
-    return -EIO;
-}
-
-// Public: poll for events and hand them to upper layer
-// Returns:
-//  >0 : number of events read
-//   0 : timeout
-//  <0 : negative errno-like
-int buttons_gpio_poll(struct buttons_gpio_ctx *ctx, int timeout_ms,
-                      int (*on_event)(unsigned offset, bool rising, uint64_t ts_ns, void *user),
-                      void *user)
-{
-    if (!ctx || !ctx->req || !ctx->evbuf || !on_event) return -EINVAL;
-
-    int w = wait_fd(ctx, timeout_ms);
-    if (w <= 0) return w; // timeout or error
-
-    int n = gpiod_line_request_read_edge_events(ctx->req, ctx->evbuf, (int)gpiod_request_config_get_event_buffer_size(ctx->rc));
-    if (n < 0) return -errno ? -errno : -EIO;
-    if (n == 0) return 0;
-
-    for (int i = 0; i < n; i++) {
-        const struct gpiod_edge_event *ev = gpiod_edge_event_buffer_get_event(ctx->evbuf, i);
-        // v2 returns const event owned by buffer; do not free ev.
-        bool rising = (gpiod_edge_event_get_event_type((struct gpiod_edge_event *)ev) == GPIOD_EDGE_EVENT_RISING_EDGE);
-        unsigned off = gpiod_edge_event_get_line_offset((struct gpiod_edge_event *)ev);
-
-        struct timespec ts = gpiod_edge_event_get_timestamp((struct gpiod_edge_event *)ev);
-        uint64_t ts_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-
-        int rc = on_event(off, rising, ts_ns, user);
-        if (rc) return rc; // allow upper layer to stop early
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--chip") && i+1 < argc)          chip = argv[++i];
+        else if (!strcmp(argv[i], "--active-low"))             active_low = true;
+        else if (!strcmp(argv[i], "--debounce-ms") && i+1 < argc) debounce_ms = (unsigned)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--min-gap-ms") && i+1 < argc)  min_gap_ms = (unsigned)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--map") && i+1 < argc)      map_str = argv[++i];
+        else { usage(argv[0]); return 2; }
     }
-    return n;
-}
 
-// Optional: read level helper (not all upper layers need this)
-int buttons_gpio_read_level(struct buttons_gpio_ctx *ctx, unsigned offset, int *level_out)
-{
-    if (!ctx || !ctx->req || !level_out) return -EINVAL;
-    // gpiod v2 allows snapshot reads via line_request_get_values, but we keep a single offset read
-    int value;
-    if (gpiod_line_request_get_value(ctx->req, offset, &value)) return -errno ? -errno : -EIO;
-    *level_out = value;
+    if (!map_str) {
+        fprintf(stderr, "Missing --map\n");
+        usage(argv[0]);
+        return 2;
+    }
+
+    struct key_map map[BUTTONS_MAX_LINES];
+    size_t map_count = 0;
+    if (parse_map(map_str, map, &map_count)) {
+        fprintf(stderr, "Bad --map format\n");
+        return 2;
+    }
+
+    unsigned offsets[BUTTONS_MAX_LINES];
+    for (size_t i = 0; i < map_count; i++) offsets[i] = map[i].offset;
+
+    struct app app;
+    memset(&app, 0, sizeof(app));
+    app.map = map;
+    app.map_count = map_count;
+    app.min_gap_ms = min_gap_ms;
+
+    if (buttons_gpio_open(&app.gpio, chip, offsets, map_count, active_low, debounce_ms, 64)) {
+        fprintf(stderr, "GPIO open failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    app.ufd = uinput_setup();
+    if (app.ufd < 0) {
+        fprintf(stderr, "uinput setup failed: %s\n", strerror(-app.ufd));
+        buttons_gpio_close(app.gpio);
+        return 1;
+    }
+
+    // Main loop
+    for (;;) {
+        int r = buttons_gpio_poll(app.gpio, 1000, on_gpio_event, &app);
+        if (r < 0) {
+            // transient errors can be ignored or break depending on policy
+            // here we just continue
+            usleep(5 * 1000);
+        }
+    }
+
+    // never reached
+    // UI_DEV_DESTROY and close will be done by OS on exit
     return 0;
 }
