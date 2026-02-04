@@ -63,13 +63,20 @@ target_link_libraries(buttons PUBLIC
 
 # ---------- Uygulama ----------
 add_executable(keypad-hid examples/keypad-hid.c)
+
+target_include_directories(buttons PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
 target_include_directories(keypad-hid PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(keypad-hid PRIVATE buttons)
 
+target_link_libraries(keypad-hid PRIVATE buttons)
 
 # ---------- Kurulum ----------
 include(GNUInstallDirs)
