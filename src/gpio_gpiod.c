@@ -11,7 +11,6 @@
 #include <string.h>
 #include <errno.h>
 #include <time.h>
-
 #include <gpiod.h>
 #include "buttons.h"
 
@@ -129,15 +128,9 @@ void buttons_gpio_close(struct buttons_gpio_ctx *ctx)
 
 static int wait_events(struct buttons_gpio_ctx *ctx, int timeout_ms)
 {
-    if (timeout_ms < 0) {
-        int r = gpiod_line_request_wait_edge_events(ctx->req, NULL);
-        if (r < 0) return -errno ? -errno : -EIO;
-        return r; // 0 never returned with NULL timeout
-    }
-    struct timespec ts;
-    ts.tv_sec  = timeout_ms / 1000;
-    ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
-    int r = gpiod_line_request_wait_edge_events(ctx->req, &ts);
+    // libgpiod v2: timeout is int64_t nanoseconds; negative blocks indefinitely
+    int64_t ns = (timeout_ms < 0) ? -1 : (int64_t)timeout_ms * 1000000LL;
+    int r = gpiod_line_request_wait_edge_events(ctx->req, ns);
     if (r < 0) return -errno ? -errno : -EIO;
     return r; // 0 = timeout, >0 = ready
 }
