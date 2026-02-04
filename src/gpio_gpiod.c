@@ -1,289 +1,208 @@
-// src/gpio_gpiod.c
-// libgpiod v2 backend for edge events (safe for Debian Trixie/RPi Bookworm)
-// - Uses request API with edge buffer
-// - No per-event free (avoids double-free/invalid pointer on v2)
-// - Optional debounce via line settings
-// - Active-low configurable
-// - Minimal surface: open / poll one event / close
-// NOTE: If your header declares different symbol names or signatures,
-// adjust the three exported functions at the bottom accordingly.
+// SPDX-License-Identifier: MIT
+// GPIO backend for libgpiod v2.x
+// Notes:
+// - Uses gpiod v2 API (gpiod_chip_open, *_debounce_period_us, edge event buffer)
+// - Never free single edge events (buffer owns them)
+// - Builds a single request for all input lines with both-edge detection
 
-#include <errno.h>
-#include <inttypes.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
+#include <errno.h>
 #include <time.h>
-#include <unistd.h>
+#include <poll.h>
 
-#include <gpiod.h>   // libgpiod v2
+#include <gpiod.h>
+#include "buttons.h"    // keep existing public prototypes/types
 
-#include "buttons.h" // keep include to match project build; unused types are OK
+#ifndef BUTTONS_MAX_LINES
+#define BUTTONS_MAX_LINES 32
+#endif
 
-// ---------- helpers ----------
-
-static inline uint64_t timespec_to_ns(const struct timespec *ts) {
-    return (uint64_t)ts->tv_sec * 1000000000ull + (uint64_t)ts->tv_nsec;
-}
-
-static inline struct timespec ns_to_timespec(uint64_t ns) {
-    struct timespec ts;
-    ts.tv_sec = (time_t)(ns / 1000000000ull);
-    ts.tv_nsec = (long)(ns % 1000000000ull);
-    return ts;
-}
-
-static inline uint64_t mono_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return timespec_to_ns(&ts);
-}
-
-// ---------- backend context ----------
-
-struct gpio_backend_ctx {
-    struct gpiod_chip *chip;
-    struct gpiod_line_settings *ls_in;
-    struct gpiod_line_config *lcfg;
-    struct gpiod_request_config *rcfg;
-    struct gpiod_line_request *req;
+struct buttons_gpio_ctx {
+    struct gpiod_chip            *chip;
+    struct gpiod_line_settings   *ls_in;
+    struct gpiod_line_config     *lc;
+    struct gpiod_request_config  *rc;
+    struct gpiod_line_request    *req;
     struct gpiod_edge_event_buffer *evbuf;
 
-    unsigned *offsets;
-    size_t n_offsets;
-
-    bool active_low;
-    unsigned debounce_ms;
-
-    // map offset -> index [0..n_offsets)
-    // built once at open
-    unsigned max_offset;     // highest offset value seen
-    int *offset_to_index;    // length = max_offset + 1, -1 for not used
+    unsigned offsets[BUTTONS_MAX_LINES];
+    size_t   count;
+    bool     active_low;
+    uint32_t debounce_ms;
 };
 
-// Single-instance for simple library usage; extend if multi-instances are needed.
-static struct gpio_backend_ctx *G = NULL;
-
-// ---------- open ----------
-
-static int build_offset_index_map(struct gpio_backend_ctx *ctx) {
-    size_t i;
-    unsigned maxo = 0;
-    for (i = 0; i < ctx->n_offsets; ++i) {
-        if (ctx->offsets[i] > maxo) maxo = ctx->offsets[i];
-    }
-    ctx->max_offset = maxo;
-    ctx->offset_to_index = (int *)malloc((size_t)(maxo + 1) * sizeof(int));
-    if (!ctx->offset_to_index) return -ENOMEM;
-    for (unsigned o = 0; o <= maxo; ++o) ctx->offset_to_index[o] = -1;
-    for (i = 0; i < ctx->n_offsets; ++i) {
-        ctx->offset_to_index[ctx->offsets[i]] = (int)i;
-    }
+static int make_devpath(const char *chip_name, char out[128])
+{
+    if (!chip_name || !*chip_name)
+        return -EINVAL;
+    if (chip_name[0] == '/')
+        snprintf(out, 128, "%s", chip_name);
+    else
+        snprintf(out, 128, "/dev/%s", chip_name);
     return 0;
 }
 
-/*
- * Exported:
- * int buttons_gpio_open(const char *chip_name,
- *                       const unsigned *offsets, size_t n_offsets,
- *                       bool active_low,
- *                       unsigned debounce_ms);
- *
- * Returns 0 on success, negative errno on error.
- */
-int buttons_gpio_open(const char *chip_name,
-                      const unsigned *offsets, size_t n_offsets,
+int buttons_gpio_open(struct buttons_gpio_ctx **out,
+                      const char *chip_name,
+                      const unsigned *offsets,
+                      size_t count,
                       bool active_low,
-                      unsigned debounce_ms)
+                      unsigned debounce_ms,
+                      unsigned event_buf)
 {
-    int ret = 0;
-    size_t i;
-
-    if (G) {
-        // already open
-        return -EBUSY;
-    }
-    if (!chip_name || !offsets || n_offsets == 0) {
+    if (!out || !chip_name || !offsets || !count || count > BUTTONS_MAX_LINES)
         return -EINVAL;
-    }
 
-    struct gpio_backend_ctx *ctx = (struct gpio_backend_ctx *)calloc(1, sizeof(*ctx));
+    *out = NULL;
+
+    struct buttons_gpio_ctx *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return -ENOMEM;
 
-    ctx->offsets = (unsigned *)malloc(n_offsets * sizeof(unsigned));
-    if (!ctx->offsets) { free(ctx); return -ENOMEM; }
-    memcpy(ctx->offsets, offsets, n_offsets * sizeof(unsigned));
-    ctx->n_offsets = n_offsets;
+    ctx->count      = count;
     ctx->active_low = active_low;
-    ctx->debounce_ms = debounce_ms;
+    ctx->debounce_ms = debounce_ms ? debounce_ms : 0;
 
-    ret = build_offset_index_map(ctx);
-    if (ret) { free(ctx->offsets); free(ctx); return ret; }
+    for (size_t i = 0; i < count; i++)
+        ctx->offsets[i] = offsets[i];
 
-    // 1) open chip
-    ctx->chip = gpiod_chip_open_by_name(chip_name);
+    char dev[128];
+    int rc = make_devpath(chip_name, dev);
+    if (rc) { free(ctx); return rc; }
+
+    ctx->chip = gpiod_chip_open(dev);
     if (!ctx->chip) {
-        ret = -errno ? -errno : -ENODEV;
-        goto fail;
+        rc = -errno ? -errno : -ENODEV;
+        free(ctx);
+        return rc;
     }
 
-    // 2) line settings
+    // line settings: input, both edges, optional active-low and debounce
     ctx->ls_in = gpiod_line_settings_new();
-    if (!ctx->ls_in) { ret = -ENOMEM; goto fail; }
+    if (!ctx->ls_in) { rc = -ENOMEM; goto fail; }
 
     gpiod_line_settings_set_direction(ctx->ls_in, GPIOD_LINE_DIRECTION_INPUT);
     gpiod_line_settings_set_edge_detection(ctx->ls_in, GPIOD_LINE_EDGE_BOTH);
-    gpiod_line_settings_set_active_low(ctx->ls_in, active_low ? true : false);
-    // Optional bias can be configured here if needed:
-    // gpiod_line_settings_set_bias(ctx->ls_in, GPIOD_LINE_BIAS_PULL_UP / PULL_DOWN / DISABLED);
 
-    if (debounce_ms > 0) {
-        struct timespec period = ns_to_timespec((uint64_t)debounce_ms * 1000000ull);
-        // Available on libgpiod v2:
-        gpiod_line_settings_set_debounce_period(ctx->ls_in, &period);
-    }
+    if (ctx->active_low)
+        gpiod_line_settings_set_active_low(ctx->ls_in, true);
 
-    // 3) line config
-    ctx->lcfg = gpiod_line_config_new();
-    if (!ctx->lcfg) { ret = -ENOMEM; goto fail; }
+    // Bias is left as "as is" unless buttons.h exposes a policy; keep default.
 
-    // Apply same settings to all offsets
-    if (gpiod_line_config_add_line_settings(ctx->lcfg, ctx->offsets, ctx->n_offsets, ctx->ls_in) != 0) {
-        ret = -errno ? -errno : -EINVAL;
+    if (ctx->debounce_ms > 0)
+        gpiod_line_settings_set_debounce_period_us(ctx->ls_in,
+                                                   (uint32_t)ctx->debounce_ms * 1000U);
+
+    ctx->lc = gpiod_line_config_new();
+    if (!ctx->lc) { rc = -ENOMEM; goto fail; }
+
+    if (gpiod_line_config_add_line_settings(ctx->lc, ctx->offsets, (unsigned)ctx->count, ctx->ls_in)) {
+        rc = -errno ? -errno : -EINVAL;
         goto fail;
     }
 
-    // 4) request config
-    ctx->rcfg = gpiod_request_config_new();
-    if (!ctx->rcfg) { ret = -ENOMEM; goto fail; }
-    gpiod_request_config_set_consumer(ctx->rcfg, "buttons-sdk");
+    ctx->rc = gpiod_request_config_new();
+    if (!ctx->rc) { rc = -ENOMEM; goto fail; }
 
-    // 5) request lines
-    ctx->req = gpiod_chip_request_lines(ctx->chip, ctx->rcfg, ctx->lcfg);
+    gpiod_request_config_set_consumer(ctx->rc, "buttons-sdk");
+    if (event_buf == 0) event_buf = 32;
+    gpiod_request_config_set_event_buffer_size(ctx->rc, event_buf);
+
+    ctx->req = gpiod_chip_request_lines(ctx->chip, ctx->rc, ctx->lc);
     if (!ctx->req) {
-        ret = -errno ? -errno : -EIO;
+        rc = -errno ? -errno : -EIO;
         goto fail;
     }
 
-    // 6) event buffer (capacity 32)
-    ctx->evbuf = gpiod_edge_event_buffer_new(32);
+    ctx->evbuf = gpiod_edge_event_buffer_new(event_buf);
     if (!ctx->evbuf) {
-        ret = -ENOMEM;
+        rc = -ENOMEM;
         goto fail;
     }
 
-    G = ctx;
+    *out = ctx;
     return 0;
 
 fail:
-    if (ctx->evbuf) {
-        // Safe to free buffer object itself (do not free individual events).
-        gpiod_edge_event_buffer_free(ctx->evbuf);
-    }
-    if (ctx->req) {
-        gpiod_line_request_release(ctx->req);
-    }
-    if (ctx->rcfg) gpiod_request_config_free(ctx->rcfg);
-    if (ctx->lcfg) gpiod_line_config_free(ctx->lcfg);
+    if (ctx->evbuf) gpiod_edge_event_buffer_free(ctx->evbuf);
+    if (ctx->req)   gpiod_line_request_release(ctx->req);
+    if (ctx->rc)    gpiod_request_config_free(ctx->rc);
+    if (ctx->lc)    gpiod_line_config_free(ctx->lc);
     if (ctx->ls_in) gpiod_line_settings_free(ctx->ls_in);
-    if (ctx->chip) gpiod_chip_close(ctx->chip);
-
-    free(ctx->offset_to_index);
-    free(ctx->offsets);
+    if (ctx->chip)  gpiod_chip_close(ctx->chip);
     free(ctx);
-    return ret;
+    return rc;
 }
 
-// ---------- poll one event ----------
-
-/*
- * Exported:
- * int buttons_gpio_poll(int timeout_ms, unsigned *index, int *edge);
- *
- * Waits for a single edge. On success returns 1 and fills:
- *  - *index = index within the provided offsets array [0..n-1]
- *  - *edge  = +1 for rising, 0 for falling
- * Returns 0 on timeout, negative errno on error.
- */
-int buttons_gpio_poll(int timeout_ms, unsigned *index, int *edge)
+void buttons_gpio_close(struct buttons_gpio_ctx *ctx)
 {
-    if (!G || !G->req) return -EINVAL;
-
-    uint64_t to_ns = (timeout_ms < 0) ? 0 : (uint64_t)timeout_ms * 1000000ull;
-
-    // 1) wait
-    int rv = gpiod_line_request_wait_edge_events(G->req,
-                                                 (timeout_ms < 0) ? NULL : &ns_to_timespec(to_ns));
-    if (rv < 0) {
-        return -errno ? -errno : -EIO;
-    }
-    if (rv == 0) {
-        // timeout
-        return 0;
-    }
-
-    // 2) read (up to buffer capacity)
-    int n = gpiod_line_request_read_edge_events(G->req, G->evbuf, 32);
-    if (n < 0) {
-        return -errno ? -errno : -EIO;
-    }
-    if (n == 0) {
-        // spurious wake
-        return 0;
-    }
-
-    // Handle only the first event; drop the rest intentionally here.
-    const struct gpiod_edge_event *ev = gpiod_edge_event_buffer_get_event(G->evbuf, 0);
-    if (!ev) {
-        return -EIO;
-    }
-
-    unsigned offset = gpiod_edge_event_get_line_offset(ev);
-    int idx = -1;
-    if (offset <= G->max_offset) idx = G->offset_to_index[offset];
-    if (idx < 0) {
-        // Unknown offset; ignore gracefully
-        return 0;
-    }
-
-    enum gpiod_edge_event_type t = gpiod_edge_event_get_event_type((struct gpiod_edge_event *)ev);
-    int is_rising = (t == GPIOD_EDGE_EVENT_RISING_EDGE) ? 1 : 0;
-
-    if (index) *index = (unsigned)idx;
-    if (edge)  *edge  = is_rising;
-
-    // Do NOT free individual events on libgpiod v2.
-    // Buffer object will be freed at close.
-
-    return 1;
+    if (!ctx) return;
+    if (ctx->evbuf) gpiod_edge_event_buffer_free(ctx->evbuf);
+    if (ctx->req)   gpiod_line_request_release(ctx->req);
+    if (ctx->rc)    gpiod_request_config_free(ctx->rc);
+    if (ctx->lc)    gpiod_line_config_free(ctx->lc);
+    if (ctx->ls_in) gpiod_line_settings_free(ctx->ls_in);
+    if (ctx->chip)  gpiod_chip_close(ctx->chip);
+    free(ctx);
 }
 
-// ---------- close ----------
-
-/*
- * Exported:
- * void buttons_gpio_close(void);
- */
-void buttons_gpio_close(void)
+// Helper: poll request FD
+static int wait_fd(struct buttons_gpio_ctx *ctx, int timeout_ms)
 {
-    if (!G) return;
+    int fd = gpiod_line_request_get_poll_fd(ctx->req);
+    if (fd < 0) return -EIO;
 
-    // Safe to free the buffer object itself (do not free individual events).
-    if (G->evbuf) gpiod_edge_event_buffer_free(G->evbuf);
-
-    if (G->req)   gpiod_line_request_release(G->req);
-    if (G->rcfg)  gpiod_request_config_free(G->rcfg);
-    if (G->lcfg)  gpiod_line_config_free(G->lcfg);
-    if (G->ls_in) gpiod_line_settings_free(G->ls_in);
-    if (G->chip)  gpiod_chip_close(G->chip);
-
-    free(G->offset_to_index);
-    free(G->offsets);
-    free(G);
-    G = NULL;
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    int pr = poll(&p, 1, timeout_ms);
+    if (pr < 0) return -errno;
+    if (pr == 0) return 0; // timeout
+    if (p.revents & POLLIN) return 1;
+    return -EIO;
 }
 
-/* End of file */
+// Public: poll for events and hand them to upper layer
+// Returns:
+//  >0 : number of events read
+//   0 : timeout
+//  <0 : negative errno-like
+int buttons_gpio_poll(struct buttons_gpio_ctx *ctx, int timeout_ms,
+                      int (*on_event)(unsigned offset, bool rising, uint64_t ts_ns, void *user),
+                      void *user)
+{
+    if (!ctx || !ctx->req || !ctx->evbuf || !on_event) return -EINVAL;
+
+    int w = wait_fd(ctx, timeout_ms);
+    if (w <= 0) return w; // timeout or error
+
+    int n = gpiod_line_request_read_edge_events(ctx->req, ctx->evbuf, (int)gpiod_request_config_get_event_buffer_size(ctx->rc));
+    if (n < 0) return -errno ? -errno : -EIO;
+    if (n == 0) return 0;
+
+    for (int i = 0; i < n; i++) {
+        const struct gpiod_edge_event *ev = gpiod_edge_event_buffer_get_event(ctx->evbuf, i);
+        // v2 returns const event owned by buffer; do not free ev.
+        bool rising = (gpiod_edge_event_get_event_type((struct gpiod_edge_event *)ev) == GPIOD_EDGE_EVENT_RISING_EDGE);
+        unsigned off = gpiod_edge_event_get_line_offset((struct gpiod_edge_event *)ev);
+
+        struct timespec ts = gpiod_edge_event_get_timestamp((struct gpiod_edge_event *)ev);
+        uint64_t ts_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+
+        int rc = on_event(off, rising, ts_ns, user);
+        if (rc) return rc; // allow upper layer to stop early
+    }
+    return n;
+}
+
+// Optional: read level helper (not all upper layers need this)
+int buttons_gpio_read_level(struct buttons_gpio_ctx *ctx, unsigned offset, int *level_out)
+{
+    if (!ctx || !ctx->req || !level_out) return -EINVAL;
+    // gpiod v2 allows snapshot reads via line_request_get_values, but we keep a single offset read
+    int value;
+    if (gpiod_line_request_get_value(ctx->req, offset, &value)) return -errno ? -errno : -EIO;
+    *level_out = value;
+    return 0;
+}
