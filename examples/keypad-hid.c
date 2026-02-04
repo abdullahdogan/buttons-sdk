@@ -16,25 +16,7 @@
 #include <linux/uinput.h>
 #include <linux/input.h>
 
-#if __has_include("buttons.h")
-  #include "buttons.h"
-#elif __has_include("../src/buttons.h")
-  #include "../src/buttons.h"
-#else
-  // Fallback for build-only environment
-  #ifndef BUTTONS_MAX_LINES
-  #define BUTTONS_MAX_LINES 64
-  #endif
-  struct buttons_gpio_ctx;
-  int buttons_gpio_open(struct buttons_gpio_ctx **out, const char *chip_name,
-                        const unsigned *offsets, size_t n_offsets,
-                        bool active_low, unsigned debounce_ms,
-                        size_t queue_capacity);
-  int buttons_gpio_poll(struct buttons_gpio_ctx *ctx, int timeout_ms,
-                        int (*on_event)(unsigned offset, bool rising, uint64_t ts_ns, void *user),
-                        void *user);
-  void buttons_gpio_close(struct buttons_gpio_ctx *ctx);
-#endif
+#include "buttons.h"  // ensure we see buttons_gpio_* and BUTTONS_MAX_LINES
 
 #ifndef BUTTONS_MAX_LINES
 #define BUTTONS_MAX_LINES 64
@@ -59,14 +41,10 @@ struct app_ctx {
     struct state_per_line st[BUTTONS_MAX_LINES];
 };
 
-// ---- time helpers ----
-
 static uint64_t tv_to_ns(const struct timeval *tv)
 {
     return (uint64_t)tv->tv_sec * 1000000000ull + (uint64_t)tv->tv_usec * 1000ull;
 }
-
-// ---- uinput helpers ----
 
 static int uinput_open(void)
 {
@@ -79,7 +57,6 @@ static int uinput_setup_keyboard(int fd, const int *keycodes, size_t n)
 {
     if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0) return -errno;
     if (ioctl(fd, UI_SET_EVBIT, EV_SYN) < 0) return -errno;
-    // Do not enable EV_REP (no OS autorepeat from this device)
 
     for (size_t i = 0; i < n; i++) {
         if (keycodes[i] > 0)
@@ -127,8 +104,6 @@ static int uinput_send_key(int fd, int keycode, int value01)
 {
     return uinput_emit(fd, EV_KEY, (uint16_t)keycode, value01);
 }
-
-// ---- key map parse ----
 
 static int keyname_to_code(const char *name)
 {
@@ -187,8 +162,6 @@ static int build_offsets_array(const struct key_map *m, size_t n, unsigned *offs
     return 0;
 }
 
-// ---- gpio event callback ----
-
 static int on_gpio_event(unsigned offset, bool rising, uint64_t ts_ns, void *user)
 {
     struct app_ctx *app = (struct app_ctx *)user;
@@ -221,8 +194,6 @@ static int on_gpio_event(unsigned offset, bool rising, uint64_t ts_ns, void *use
 
     return 0;
 }
-
-// ---- usage ----
 
 static void usage(const char *prog)
 {
